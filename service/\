@@ -1,0 +1,320 @@
+/*
+ *  Copyright (c) 2015, University of Michigan.
+ *  All rights reserved.
+ *
+ *  This source code is licensed under the BSD-style license found in the
+ *  LICENSE file in the root directory of this source tree. An additional grant
+ *  of patent rights can be found in the PATENTS file in the same directory.
+ *
+ */
+
+/**
+ * @author: Johann Hauswald, Yiping Kang
+ * @contact: jahausw@umich.edu, ypkang@umich.edu
+ */
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <iostream>
+#include <fstream>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <errno.h>
+#include <map>
+#include <glog/logging.h>
+#include <time.h>
+#include <nvml.h>
+#include <queue>
+#include <vector>
+
+#include "scheduler.h"
+#include "boost/program_options.hpp"
+#include "socket.h"
+#include "thread.h"
+#include "tonic.h"
+#include "ts_list.h"
+#include "request.h"
+#include "batched_request.h"
+#include "mon.h"
+
+#define TOTAL_CORES 20
+using namespace std;
+namespace po = boost::program_options;
+
+/*GlobalScheduler gsc;*/
+bool USE_GPU;
+bool USE_MPS;
+FILE* pLogFile;
+int CPUID;
+
+//file + dir that containts required files
+string COMMON;
+string WEIGHT_DIR;
+string NET_LIST;
+
+static uint64_t getCurNs() {
+   struct timespec ts;
+   clock_gettime(CLOCK_REALTIME, &ts);
+   uint64_t t = ts.tv_sec*1000*1000*1000 + ts.tv_nsec;
+   return t;
+}
+
+
+
+string uint64_to_string( uint64_t value ) {
+    ostringstream os;
+    os << value;
+    return os.str();
+}
+
+po::variables_map parse_opts(int ac, char** av) {
+  // Declare the supported options.
+  po::options_description desc("Allowed options");
+  desc.add_options()("help,h", "Produce help message")(
+      "common,c", po::value<string>()->default_value("../common/"),
+      "Directory with configs and weights")(
+      "portno,p", po::value<int>()->default_value(8080),
+      "Port to open DjiNN on")
+      ("nets,n", po::value<string>()->default_value("nets.txt"),
+       "File with list of network configs (.prototxt/line)")
+("weights,w", po::value<string>()->default_value("weights/"),"Directory containing weights (in common)")
+
+          ("gpu,g", po::value<bool>()->default_value(false), "Use GPU?")
+("threadcnt,t",po::value<int>()->default_value(-1),"Number of threads to spawn before exiting the server. (-1 loop forever)")
+    ("ngpu,ng", po::value<int>()->default_value(4),"number of gpus in system to run service")
+    ("scheduler,s",po::value<string>()->default_value("no"),"scheduling mode : no, greedy, dedicated, proposed")
+    ("profile,prof",po::value<string>()->default_value("profile.csv"),"the file which stores profile value of each network" )
+("max_batch,mb",po::value<int>()->default_value(0),"maximum batch size,0 if read by a file" )
+("max_delay, md",po::value<int>()->default_value(0),"maximum amount of time for waiting(ms)")
+("ncpu,nc",po::value<int>()->default_value(1),"number of virtual cpu devices to be spawned" )
+("mps,m",po::value<bool>()->default_value(false),"flag setting whether mps is being used")
+("opt_batch,ob",po::value<bool>()->default_value(false),"flag setting whether optimal batch is used");
+
+  po::variables_map vm;
+  po::store(po::parse_command_line(ac, av, desc), vm);
+  po::notify(vm);
+
+  if (vm.count("help")) {
+    cout << desc << "\n";
+    exit(1);
+  }
+  return vm;
+}
+
+int main(int argc, char* argv[]) {
+  // Main thread for the server
+  // Spawn a new thread for each request
+  uint64_t start, end;
+  po::variables_map vm = parse_opts(argc, argv);
+
+  USE_GPU = vm["gpu"].as<bool>();
+  USE_MPS = vm["mps"].as<bool>();
+
+  int numofGPU=vm["ngpu"].as<int>();
+  int numofCPU=vm["ncpu"].as<int>();
+  if (numofCPU != 0 && TOTAL_CORES % numofCPU){
+    printf("exiting server, cannot equally devide cores among %d CPUs\n", numofCPU);
+    exit(1);
+  }
+  
+  // set the CPU ID to be number of GPUs
+  CPUID=numofGPU;
+
+  // global variable needed to load all models to gpus at init
+  COMMON = vm["common"].as<string>();
+  NET_LIST = vm["nets"].as<string>();
+  WEIGHT_DIR = vm["weights"].as<string>();
+
+ 
+  //initiate threads and scheduler/monitor
+ // init scheduler
+  string mode=vm["scheduler"].as<string>();
+/*  if(!gsc.setSchedulingMode(mode)){
+    printf("exiting server due to undefined scheduling mode\n");
+    exit(1);
+  }
+*/
+// setup some global & systemwide variables 
+/*
+  gsc.setNGPUs(numofGPU);
+  gsc.setupNumCPUDevices(numofCPU);
+  gsc.setupMonitor();
+  gsc.setupNetNames(NET_LIST);
+
+  string profile_dir= vm["profile"].as<string>();
+  gsc.setProcInfos(profile_dir);
+#ifdef DEBUG
+  gsc.printProfileInfo();
+#endif 
+  
+  int maxBatch=vm["max_batch"].as<int>();
+  int maxDelay=vm["max_delay"].as<int>();
+
+  if(!maxBatch)
+	gsc.setupMaxBatch(string("MaxBatch.txt")); // for now lets just hard code the file name 
+  else
+	gsc.setupMaxBatch(maxBatch);
+  gsc.setupMaxDelay(maxDelay);
+
+  //TEMP : setup speedup per benchmark, for speeup experiment
+  if (mode=="static_greedy"){
+  gsc.setupSpeedup(string("speedup.txt"));
+  }
+  else if(mode == "table_greedy"){
+      gsc.setupTableModel("gpuprof.csv", "cpuprof.csv"); // for now lets hard code the file names 
+  }
+  else if(mode == "fair"){
+        gsc.setupSpeedup(string("speedup.txt"));   
+      gsc.setupWeightedEpoch("weightedepoch.txt");
+    }
+  else if(mode == "min_lat"){
+        gsc.setupMaxBatch(string("MaxBatch.txt")); // make sure max batch is updated by this file
+    }
+  else if(mode == "credit"){
+    
+        gsc.setupPriority("priority.txt");
+        gsc.setupWeightedEpoch("weightedepoch.txt");
+        gsc.initCreditTable();
+  }
+  else if(mode == "mps"){
+    gsc.setupPriority("priority.txt");
+    gsc.setupWeightedEpoch("weightedepoch.txt");
+    gsc.initCreditTable();
+
+  }
+*/
+/*
+  pLogFile=fopen("log.txt","w");
+  fprintf(pLogFile,"task,taskID,deviceID,REQ_TO_RECVQ,RECVQ_TO_BATCH,BATCH_TO_EXEC,EXEC,SEND_RESULTS\n");
+  fflush(pLogFile);
+
+  pthread_t tid;
+  tid=  initServerThread(numofGPU);
+  sleep((gsc.getNGPUs() + gsc.getNCPUs()) * 5 ) ;
+  */
+    
+ // how many threads to spawn before exiting
+  // -1 to stay indefinitely open
+   int thread_cnt = 0;
+  int total_thread_cnt = vm["threadcnt"].as<int>();
+  int socketfd = SERVER_init(vm["portno"].as<int>());
+
+/*
+// init threads that need to ron in background
+  initPerfMonThread();
+  initClearThread();
+//  initGPUUtilThread();
+  initEpochThread();
+ */
+ // Listen on socket
+  listen(socketfd, 10);
+
+    cout << "Server is listening for requests on " << vm["portno"].as<int>()<<endl;
+   // Main Loop
+ 
+  while (1) {
+ 
+    pthread_t new_thread_id;
+      int client_sock = accept(socketfd, (sockaddr*)0, (unsigned int*)0);
+#ifdef DEBUG
+      cout << "accepting new socket , "<<client_sock << endl; 
+#endif 
+  
+    if (client_sock == -1) {
+      LOG(ERROR) << "Failed to accept.\n";
+      continue;
+    }    
+   
+     new_thread_id = initRequestThread(client_sock);
+     
+
+    ++thread_cnt;
+    if (thread_cnt == total_thread_cnt) {
+      if (pthread_join(new_thread_id, NULL) != 0) {
+        LOG(FATAL) << "Failed to join.\n";
+      }
+      break;
+    }
+  }
+
+  return 0;
+}
+
+pthread_t initRequestThread(int sock){                                                                                       
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1024 * 1024); // set memory size, may need to adjust in the future, for now set it to 1MB
+    pthread_t tid;
+    if (pthread_create(&tid, &attr, handleRequest, (void *)(intptr_t)sock) != 0)
+        LOG(ERROR) << "Failed to create a request handler thread.\n";
+    return tid;
+
+}
+
+void* handleRequest(void* sock){
+    uint64_t start;
+    int SockNum = (intptr_t)sock;
+    char NetName[MAX_REQ_SIZE]; 
+    //receive request 
+    SOCKET_receive(SockNum, (char*)&NetName, MAX_REQ_SIZE, false);
+      LOG(ERROR) <<"RECV!"<<endl;
+    string StrName(NetName);
+    //need to check valid request name
+    //map<string, Net<float>*>::iterator it = ServerState.Nets[0].find(NetName);
+   /* if (it == ServerState.Nets[0].end()) {
+        printf("task : %s not found \n", NetName);
+        return (void*)1;
+    } else
+        LOG(INFO) << "Task " << NetName << " forward pass.";*/
+    //receive data length : number of data x data size
+    int Datalen = SOCKET_rxsize(SockNum);
+
+    //printf("received data! Batchsize : %d, Datalen: %d \n",Batchsize,Datalen);
+	int TaskID = 0; 
+    while (1) {   
+
+        float *inData = (float *)malloc(Datalen * sizeof(float));
+        int rcvd = SOCKET_receive(SockNum, (char *)inData,Datalen * sizeof(float) ,false);
+
+        if (rcvd == 0) break;  // Client closed the socket    
+        int reqID = SOCKET_rxsize(SockNum);
+#ifdef DEBUG
+       printf("RECV: received reqID : %d\n",reqID);
+#endif
+        //make a request and push it to the list
+        CntMtx.lock(); //lock counter
+        TaskID++;
+        CntMtx.unlock(); // unlock counter
+        start=getCurNs();
+        request *pReq = new request(TaskID, SockNum, Batchsize);
+        pReq->setState(QUEUED);
+        pReq->setReqName(NetName);
+        pReq->_input.assign(inData,inData+Datalen);
+        pReq->setReqID(reqID);
+        //update the batch table and linked list 
+        ServerState.ReqListHashTable[StrName]->pushBack(*pReq);
+ /*       perTaskBTMtx[StrName].lock();
+        ServerState.BatchTable[StrName]++;
+        perTaskBTMtx[StrName].unlock(); 
+        perfstarted=true;
+        utilstarted=true;
+        perfMonCV.notify_all();
+        utilMonCV.notify_all();
+        //lock_guard<mutex> lk(cv_mtx);
+        readyMtx.lock();
+        ready=ServerState.ReqListHashTable[StrName]->getLength(); // set the flag!
+        readyMtx.unlock();
+        readyCV.notify_all();*/
+
+        //cv.notify_one();
+#ifdef DEBUG
+        printf(" Made request task id  %d which is  %lu bytes long \n", TaskID,pReq->_input.size());
+#endif 
+        pReq->endRecv=getCurNs();
+        pReq->start=start;
+    }
+    close(SockNum);
+}
+
+

@@ -1,0 +1,1045 @@
+#include <fstream>
+#include <unistd.h>
+#include <sstream>
+#include <iostream>
+#include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <ctime>
+#include <cmath>
+#include <glog/logging.h>
+#include <boost/chrono/thread_clock.hpp>
+#include <time.h>
+#include <cstring>
+#include <assert.h>
+#include <condition_variable>
+#define NUMA_AWARE 0 // set flag for numa awareness 
+#define FIXED_CORES 1 // used for setting up fixed number of cores
+#define PROXY 1  // used for communicating with proxy 
+
+#if NUMA_AWARE
+#include <numa.h>
+#include <numaif.h>
+#endif
+
+#include "timer.h"
+#include "thread.h"
+#include "ts_list.h"
+#include "request.h"
+#include "batched_request.h"
+#include "scheduler.h"
+#include "ThreadPool.h"
+#include "mon.h"
+
+#define MUTRACE_CNT 5000
+
+
+// sets how many tasks can be scheduled/batching on the device at the same time 
+#define MAX_CPU_TYPE 2
+#define MAX_GPU_TYPE 2
+// sets how many tasks can run on the device at the same time 
+#define MAX_GPU_RUN_SLOT 1
+#define MAX_CPU_RUN_SLOT 1
+
+
+#define THREAD_PER_DEV 2 // sets how many threads will run per device, 2 is empirically the best option 
+#define TOTAL_CORES 20 
+
+int execCnt;
+
+extern GlobalScheduler gsc;
+extern bool USE_GPU;
+extern bool USE_MPS;
+unsigned int TaskID;
+extern string NET_LIST;
+extern string COMMON;
+extern string WEIGHT_DIR;
+extern FILE* pLogFile;
+extern int CPUID;
+
+//2019-1-3 : fixed cores for each device 
+#if FIXED_CORES
+int gpucores[4][2]={{0,1},{2,3},{10,11},{12,13}};
+int cpucores[2][6]={{4,5,6,7,8,9},{14,15,16,17,18,19}};
+#endif 
+
+//2019-1-9 : just for checking 
+map<string, int> perTaskCnt;
+
+
+//system state related variables
+SysInfo ServerState;
+
+
+//  synch related variables
+map<string, mutex*> ReqMtxVec;
+mutex CntMtx; // mutex associated with task id counter value
+mutex gscMtx; // "			global sheduler
+mutex readyMtx;// "			ready flag
+mutex clearMtx;// " 			clear flag
+mutex schedMtx;//   "           calling schedulers 
+
+map<string, mutex> perTaskBTMtx; // batch table Mtx
+
+condition_variable readyCV;
+mutex readyCVMtx; // the global_mutex used with the conditional variable
+condition_variable clearCV;
+mutex clearCVMtx; // the global_mutex used with the conditional variable
+condition_variable perfMonCV;	
+condition_variable utilMonCV;
+
+
+//condition variables and vector needed for batching threads
+vector<condition_variable*> perDeviceBatchCV; 
+vector<mutex*> perDeviceBatchMtx; 
+vector<bool> perDeviceIsSetup;
+
+//used for signaling idle device threads 
+vector<condition_variable*> perDeviceIdleCV;
+vector<bool> perDeviceIdleFlag;
+
+
+/*Following flags are used in util_thread.cpp*/ 
+bool perfstarted = false; //checks whether execution has started or not, for shorter logs!
+bool utilstarted = false; //  //checks whether execution has started or not, for shorter logs!
+
+
+bool wasIdle=false;
+
+int ready=0; // works as a flag and semaphore
+int clear=0; // works as a flag and semaphore 
+
+mutex CPUMtx;
+int runningCPU=0;
+condition_variable CPUCV;
+
+mutex execMtx; // TEMP : experimental mutex 
+
+#if NUMA_AWARE
+#define MAX_NUMA_NODE 2 // used for rating CPU ID
+int numaID=0; // used only by CPUs
+
+void* PreFaultStack()                                                                                                                     
+{ 
+    const size_t NUM_PAGES_TO_PRE_FAULT = 50;
+    const size_t size = NUM_PAGES_TO_PRE_FAULT * numa_pagesize();
+    void *allocaBase = alloca(size);
+    memset(allocaBase, 0, size);
+    return allocaBase;
+}    
+
+void setNumaMemoryStack(int cpuid){ 
+    pthread_attr_t attr;
+    void *stackAddr = nullptr;
+    size_t stackSize = 0;
+    if ((0 != pthread_getattr_np(pthread_self(), &attr)) || (0 != pthread_attr_getstack(&attr, &stackAddr, &stackSize))) { 
+        printf("failed to retrieve info of attribute \n"); exit(1); }                                                      
+    const unsigned long nodeMask = 1UL << numa_node_of_cpu(cpuid);                                                                              
+    int bindRc = mbind(stackAddr, stackSize, MPOL_BIND, &nodeMask, sizeof(nodeMask), MPOL_MF_MOVE | MPOL_MF_STRICT);                        
+    PreFaultStack();                                                                                                                            
+    if (bindRc!=0){                       
+        printf("failed to bind! \n");
+        exit(1);                                                                                                                                 
+    }
+} 
+#endif
+bool isGPU(int deviceID)
+{
+    return deviceID < gsc.getNGPUs();
+}
+
+
+static uint64_t getCurNs() {
+    struct timespec ts; 
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t t = ts.tv_sec*1000*1000*1000 + ts.tv_nsec;
+    return t;
+}
+
+
+//2019-1-4 : added for fixup 
+
+void doScheduling(SysInfo* SysState){
+#ifdef DEBUG
+        printf("[SERVER] execute scheduler \n");
+        uint64_t startsched = getCurNs();
+        for (int i =0; i < gsc.getNGPUs() + gsc.getNCPUs(); i++)
+        {                                                                                                                
+                 printf("[SERVER] %lu tasks in Dev%d \n",ServerState.perDeviceBatchList[i]->size(), i);
+        }      
+#endif 
+
+    vector<string> decision;
+    decision = gsc.executeScheduler(SysState);
+    for(int i=0; i<decision.size(); i++){
+        if(decision[i] != "no" ){
+            perDeviceBatchMtx[i]->lock();
+            ServerState.perDeviceBatchList[i]->clear();
+            ServerState.perDeviceBatchList[i]->push_back(decision[i]);
+            perDeviceBatchCV[i]->notify_all(); 
+            perDeviceBatchMtx[i]->unlock();
+#ifdef DEBUG
+        uint64_t endsched = getCurNs();
+        double sched_time = double(endsched-startsched)/1000000 ;
+        printf("[SERVER] scheduling time(ms) : %lf \n", sched_time);
+        printf("[SCHEDULER] scheduled %s to device %d \n", decision[i].c_str(), i);
+#endif
+        }
+    }
+}
+
+
+//and mark each request as ended (so it can be erased properly by cleaning functions or threads)
+void sendBatchedResults(batched_request *brp, float *out, int out_elts){
+    string StrName(brp->taskRequests[0]->getReqName());
+    int offset=0; //used for indexing the start and the end of the output for each client
+    float *pPartOut;
+    bool local_debug =1;
+#ifdef DEBUG
+    //	printf("sending back results of %d clients back \n",nclient);
+#endif
+    request* pReq;
+    for(int i =0; i<brp->getNTask(); i++)
+    {
+        pReq = brp->taskRequests[i];		
+        int partial_out_elts = (int)(out_elts * ((float)pReq->getDataLen()/brp->getDataSize()));
+        pPartOut=(float *)malloc(sizeof(float)*partial_out_elts);
+        memcpy(pPartOut,out+offset,sizeof(float)*partial_out_elts);
+        offset+=partial_out_elts;
+        //		SOCKET_send(pReq->getClientFD(), (char*)pPartOut, partial_out_elts * sizeof(float), local_debug);
+        SOCKET_txsize(pReq->getClientFD(),pReq->getReqID());
+#ifdef DEBUG
+//        printf("EXEC: send result of reqID : %d\n", pReq->getReqID());
+#endif 
+
+        free(pPartOut);
+
+        pReq -> sendResult = getCurNs();
+        pReq->setDeviceID(brp->getGPUID());
+        pReq->setState(END);
+        pReq->writeToLog(pLogFile);
+        ServerState.PerfTable[StrName]++;
+        execCnt++;
+        //	printf("perf_table updated : %d \n", perf_table[str_name]);
+                clearMtx.lock();
+        clear++;
+        clearMtx.unlock();
+        clearCV.notify_all();
+    }
+}
+
+
+pthread_t initServerThread(int numGPU){
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 8*1024 * 1024); // set memory size, may need to adjust in the future, for now set it to 1MB
+    pthread_t tid;
+    if (pthread_create(&tid, &attr, initServer, (void *)(intptr_t)numGPU) != 0)
+        LOG(ERROR) << "Failed to create a request handler thread.\n";
+    return tid;
+}
+
+void ServerBasicSetup(int deviceID){
+    map<string, Net<float>*> *tlnets = new map<string, Net<float>*>();
+
+    mutex *pMtx = new mutex();
+    perDeviceBatchMtx.push_back(pMtx);
+
+    condition_variable *pCV = new condition_variable();
+    perDeviceBatchCV.push_back(pCV);
+
+    deque<string> *pdeq = new deque<string>();
+    ServerState.perDeviceBatchList.push_back(pdeq);
+
+    // need to initiate with caffe APIs for preloading
+    if (!isGPU(deviceID)){//init cpu server
+        Caffe::set_mode(Caffe::CPU);
+        ServerState.DeviceMaxScheduled[deviceID]=MAX_CPU_TYPE;
+        ServerState.DeviceMaxRun[deviceID]=MAX_CPU_RUN_SLOT;
+
+    }
+    else if(USE_GPU && isGPU(deviceID)){  //init gpu server
+        Caffe::SetDevice(deviceID);
+        Caffe::set_mode(Caffe::GPU);
+        ServerState.DeviceMaxScheduled[deviceID]=MAX_GPU_TYPE;
+        ServerState.DeviceMaxRun[deviceID]=MAX_GPU_RUN_SLOT;
+    }
+    Caffe::set_phase(Caffe::TEST);
+    ifstream file(NET_LIST.c_str());
+    string NetName;
+    while (file >> NetName){
+        if (isGPU(deviceID))
+            cout << "loading model " << NetName << " for gpu " << deviceID <<endl;
+        else
+            cout << "loading model " << NetName << " for CPU " <<endl;
+
+        // init net hashes 
+        //first check whether is a list for the hash
+        map<string,TSList<request>*>::iterator it;
+        string PureName = NetName.substr(0,NetName.size()-9);
+        it = ServerState.ReqListHashTable.find(PureName);
+        if (it == ServerState.ReqListHashTable.end()){ // if not found make a new list and insert it
+#ifdef DEBUG 
+            printf("inserting %s into hash table(s)\n", PureName.c_str());
+#endif
+#ifdef DEBUG
+            perTaskCnt[PureName]=0;
+#endif
+
+            TSList<request> *rinput = new TSList<request>();
+            ServerState.ReqListHashTable[PureName]=rinput;
+            //also make a new mutex for the request
+            mutex *rmtx = new mutex();
+            ReqMtxVec[PureName] = rmtx;
+        }
+        string net = COMMON + "/configs/" + NetName;
+        Net<float>* pNet = new Net<float>(net);
+        const std::string name = pNet->name();
+             (*tlnets)[name] = pNet;
+        std::string weights = COMMON +
+            WEIGHT_DIR + name + ".caffemodel";
+        (*tlnets)[name]->CopyTrainedLayersFrom(weights);
+        // setup shared tables that will be referenced by other threads
+        ServerState.BatchTable[name]=0;
+        ServerState.PerfTable[name]=0;
+        cout << "preloaded "<<name<<endl;
+    }
+    ServerState.Nets.push_back(*tlnets);
+    //initiate execution thread
+}
+void* initServer(void* numGPU){
+
+    wasIdle=true;
+    int _numGPU = (intptr_t)numGPU;
+    if (gsc.getNCPUs() != 0)
+    ServerState.NUM_CORES= TOTAL_CORES /gsc.getNCPUs() ; 
+    for (int i =0; i<_numGPU+gsc.getNCPUs();i++) {  // need to initiate # of gpus + 1 settings, + number of virtual CPU devices
+
+        // in order to avoid duplicate setups we set a per device flag
+        perDeviceIsSetup.push_back(false);
+        ServerState.isRunningVec.push_back(0);
+        //init two threads for each device
+
+        for(int j =0; j<THREAD_PER_DEV;j++){
+            initDeviceThread(i);
+            sleep(1);
+        }
+    }
+    execCnt=0;
+    map<string, int> deviceIDs;
+    while (1){
+        //monitor condition 
+        unique_lock<mutex> lk(readyCVMtx);	
+        readyCV.wait(lk, []{return ready;}); // waits until there is a request
+        readyMtx.lock();
+        ready=0;
+        readyMtx.unlock();
+#ifdef DEBUG 
+       // printf("server is runnning! \n ");
+#endif
+        int cnt=0; 
+        for (int i =0; i < gsc.getNGPUs() + gsc.getNCPUs(); i++){
+            cnt+=ServerState.perDeviceBatchList[i]->size();
+        }
+        if (cnt == 0)
+            wasIdle = true;
+        if(wasIdle){
+            wasIdle = false;
+            schedMtx.lock();
+            doScheduling(&ServerState);
+            schedMtx.unlock();
+        }
+            //monitors ready queues and resets 'ready' if there are left overs in the queue
+        if(!ready){ // check in case there are still left-over requests in linked list
+            for(map<string, TSList<request>*>::iterator it=ServerState.ReqListHashTable.begin(); it != ServerState.ReqListHashTable.end();it++ ){
+                if(it->second->getLength()){
+                    readyMtx.lock();
+                    ready=it->second->getLength();
+                    readyMtx.unlock();
+                }
+            }
+            if (!ready) // if still not ready, it means there are really no tasks in all queues
+                wasIdle = true;
+        }
+        lk.unlock();
+    } // infinite loop
+    return (void*)1;
+}
+
+
+pthread_t initRequestThread(int sock){
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1024 * 1024); // set memory size, may need to adjust in the future, for now set it to 1MB
+    pthread_t tid;
+    if (pthread_create(&tid, &attr, handleRequest, (void *)(intptr_t)sock) != 0)
+        LOG(ERROR) << "Failed to create a request handler thread.\n";
+    return tid;
+
+}
+
+
+void* handleRequest(void* sock){
+    uint64_t start;
+    int SockNum = (intptr_t)sock;
+    char NetName[MAX_REQ_SIZE]; 
+    //receive request 
+    SOCKET_receive(SockNum, (char*)&NetName, MAX_REQ_SIZE, false);
+    //	LOG(ERROR) <<"RECV!"<<endl;
+    string StrName(NetName);
+    //need to check valid request name
+    map<string, Net<float>*>::iterator it = ServerState.Nets[0].find(NetName);
+    if (it == ServerState.Nets[0].end()) {
+        printf("task : %s not found \n", NetName);
+        return (void*)1;
+    } else
+        LOG(INFO) << "Task " << NetName << " forward pass.";
+    //receive batch size, although unnecssasry this is recieved early on to perform some optimizations
+    // optimizations are not implemented yet but may be includedi in the future
+    int Batchsize = SOCKET_rxsize(SockNum); 
+    //receive data length : number of data x data size
+    int Datalen = SOCKET_rxsize(SockNum);
+
+    //printf("received data! Batchsize : %d, Datalen: %d \n",Batchsize,Datalen);
+
+    while (1) {   
+
+        float *inData = (float *)malloc(Datalen * sizeof(float));
+        int rcvd = SOCKET_receive(SockNum, (char *)inData,Datalen * sizeof(float) ,false);
+
+        if (rcvd == 0) break;  // Client closed the socket    
+        int reqID = SOCKET_rxsize(SockNum);
+#ifdef DEBUG
+//        printf("RECV: received reqID : %d\n",reqID);
+#endif
+        //make a request and push it to the list
+        CntMtx.lock(); //lock counter
+        TaskID++;
+        CntMtx.unlock(); // unlock counter
+        start=getCurNs();
+        request *pReq = new request(TaskID, SockNum, Batchsize);
+        pReq->setState(QUEUED);
+        pReq->setReqName(NetName);
+        pReq->_input.assign(inData,inData+Datalen);
+        pReq->setReqID(reqID);
+        //update the batch table and linked list 
+        ServerState.ReqListHashTable[StrName]->pushBack(*pReq);
+        perTaskBTMtx[StrName].lock();
+        ServerState.BatchTable[StrName]++;
+        perTaskBTMtx[StrName].unlock(); 
+        perfstarted=true;
+        utilstarted=true;
+        perfMonCV.notify_all();
+        utilMonCV.notify_all();
+        //lock_guard<mutex> lk(cv_mtx);
+        readyMtx.lock();
+        ready=ServerState.ReqListHashTable[StrName]->getLength(); // set the flag!
+        readyMtx.unlock();
+        readyCV.notify_all();
+
+        //cv.notify_one();
+#ifdef DEBUG
+ //       printf(" Made request task id  %d which is  %lu bytes long \n", TaskID,pReq->_input.size());
+#endif 
+        pReq->endRecv=getCurNs();
+        pReq->start=start;
+    }
+    close(SockNum);
+}
+pthread_t initDeviceThread(int gpu_id){
+    int deviceID = gpu_id;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1024 * 1024); // set memory size, may need to adjust in the future for now set to max * 1MB
+    pthread_t tid;
+    if (pthread_create(&tid, &attr, initDevice, (void *)(intptr_t)deviceID) != 0)
+        LOG(ERROR) << "Failed to create a batching thread.\n";
+    return tid;
+
+}
+
+//// check list, batch requests as much as possible  and call exeuction handler ////
+void*  initDevice(void *args){
+    int DeviceID = (intptr_t)args;
+    DeviceSpec *ptemp = new DeviceSpec;
+    /*
+       setup server & batching thread
+       */
+    execMtx.lock();
+    if (isGPU(DeviceID)){ // if GPU
+#if FIXED_CORES
+        cpu_set_t cpuset;
+         pthread_t thread=pthread_self(); 
+        for (int i =0; i< 2; i++){
+        CPU_SET(gpucores[DeviceID][i], &cpuset);
+         printf("core %d set for GPU %d\n",gpucores[DeviceID][i],DeviceID);
+        }
+    if (pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset)!=0){
+            printf("Error in setting affinity for cpu thread\n");
+            exit(1);
+        }
+
+#endif 
+        Caffe::SetDevice(DeviceID);
+        Caffe::set_mode(Caffe::GPU);
+        ptemp->type="gpu";        
+         }
+    else {// if CPU
+        Caffe::set_mode(Caffe::CPU);
+        ptemp->type="cpu";
+        cpu_set_t cpuset;
+        pthread_t thread=pthread_self();
+#if NUMA_AWARE 
+        int CPUID;
+        if (numaID < MAX_NUMA_NODE)
+            CPUID = 0;
+        else
+            CPUID = 1;
+        numaID++;
+        CPU_ZERO(&cpuset);
+        const int perCPUCores = TOTAL_CORES/MAX_NUMA_NODE;
+        for (int i = perCPUCores*CPUID; i<perCPUCores+perCPUCores*CPUID; i++){ // this way may not work for other machines, must check each core's numa node in the future 
+            CPU_SET(i, &cpuset);
+        }
+        int s;
+        s = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset); 
+        if (s!=0){
+            printf("Error in setting affinity for cpu thread\n");
+            exit(1);
+        }
+        setNumaMemoryStack(perCPUCores*CPUID);// must guarantee every(including first) core belongs to the same node
+   #else
+#if FIXED_CORES
+        int cpuID = DeviceID - gsc.getNGPUs();
+        for (int i = 0; i<6; i++){ 
+            CPU_SET(cpucores[cpuID][i], &cpuset);
+            printf("core %d set for CPU %d\n",cpucores[cpuID][i],cpuID);
+        }
+
+        if (pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset)!=0){
+            printf("Error in setting affinity for cpu thread\n");
+            exit(1);
+        }
+        ptemp->numcores = 6;
+
+#else 
+        int cpuID = DeviceID - gsc.getNGPUs();
+        const int perCPUCores = TOTAL_CORES/gsc.getNCPUs();
+        for (int i = perCPUCores*cpuID; i<perCPUCores+perCPUCores*cpuID; i++){ 
+            CPU_SET(i, &cpuset);
+            printf("core %d set for CPU %d\n",i,cpuID);
+        }
+        if (pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset)!=0){
+            printf("Error in setting affinity for cpu thread\n");
+            exit(1);
+        }
+        ptemp->numcores = perCPUCores;
+
+#endif 
+    #endif 
+        
+    }
+    if (!perDeviceIsSetup[DeviceID]){ // in order to avoid duplicate setup we check first!
+        perDeviceIsSetup[DeviceID]=true;
+        ServerBasicSetup(DeviceID);//set up server
+        ServerState.DeviceSpecs.push_back(ptemp);        
+#ifdef DEBUG
+   //     printf("[BATCH]DeviceID : %d is setted up \n", DeviceID);
+   //     int length = ServerState.DeviceSpecs.size();
+   //     printf("[BATCH] length of Device Specs : %d   \n", length);
+#endif 
+    }
+    warmupDevice(DeviceID);
+    execMtx.unlock();
+    while (1){
+        //wait for condition variable to be called
+        batched_request* pBatchedReq=NULL; // the local batched_request;
+        deque<string> *pBatchList = ServerState.perDeviceBatchList[DeviceID];
+        unique_lock<mutex> lk(*perDeviceBatchMtx[DeviceID]); 
+        perDeviceBatchCV[DeviceID]->wait(lk, [&pBatchList]{return pBatchList->size();});
+
+
+#ifdef DEBUG
+      //  printf("[BATCH] found %lu tasks to batch  from device %d \n",pBatchList->size(),DeviceID);
+        
+#endif 
+        string StrNetName = pBatchList->front();
+        pBatchList->pop_front();
+        lk.unlock();
+        perDeviceBatchCV[DeviceID]->notify_one();
+        while(1){
+            int maxbatch;
+            if (!(pBatchedReq)){ // if pBatchedReq is null
+                pBatchedReq = new batched_request(); 	
+                pBatchedReq->setReqName(StrNetName.c_str());
+                pBatchedReq->setState(EMPTY);
+                // 1 set the task's device which it will run on
+                pBatchedReq->setGPUID(DeviceID);
+                // 2 decide the maximum batch size allowed 
+                //2018-12-19 : scheduler should be able to setup max batch for that device not as a global state
+                if (!isGPU(DeviceID) )
+                    maxbatch = gsc.getMaxBatch(StrNetName,"cpu", DeviceID, &ServerState);
+                else
+                    maxbatch = gsc.getMaxBatch(StrNetName,"gpu", DeviceID, &ServerState);							
+                pBatchedReq->setMaxBatch(maxbatch);
+#ifdef DEBUG
+                //	printf("[BATCH] make new batched request for %s on device %d \n", pBatchedReq->getReqName(), DeviceID);
+#endif		
+            }
+#ifdef DEBUG
+            //	printf("[BATCH] batched request state : %d \n",pBatchedReq->getState());
+#endif 
+
+            if (pBatchedReq->getState() == RUNNING) continue;
+            if (pBatchedReq->getState() == END){ 			
+                break;
+            }
+            else if (pBatchedReq->getState() == EMPTY || pBatchedReq->getState() == QUEUED){
+                request* r=NULL;
+                TSList<request>* pReqList=ServerState.ReqListHashTable[StrNetName];
+#ifdef DEBUG
+                //		printf("[BATCH] Request Length : %u  \n", pReqList->getLength());
+#endif
+                ReqMtxVec[StrNetName]->lock();
+                for (int i=0; i<pReqList->getLength(); i++)
+                { // look for listed requests
+                    r = pReqList->at(i);
+                    if (!r) continue;
+#ifdef DEBUG
+                    //			printf("[BATCH] Request state : %d \n",r->getState());
+#endif
+
+                    if (r->getState() == QUEUED ){//found ya!
+
+                        //check whether new requests can be further batched											
+                        if (pBatchedReq->getNTask() < pBatchedReq->getMaxBatch()){					
+#ifdef DEBUG
+                            if (perTaskCnt[StrNetName] > r->getTaskID())
+                                printf("[BATCH]OUT OF ORDER! %d > %d \n", perTaskCnt[StrNetName], r->getTaskID());
+                            else
+                                perTaskCnt[StrNetName] = r->getTaskID();
+#endif
+                            pBatchedReq->addRequestInfo(r);	
+                            pBatchedReq->setState(QUEUED);
+                            r->endBatch=getCurNs();
+                            r->setState(BATCHED);
+                            perTaskBTMtx[StrNetName].lock(); 
+                            ServerState.BatchTable[StrNetName]--; // reduce the number of waiting requests
+                            perTaskBTMtx[StrNetName].unlock(); 
+
+
+#ifdef DEBUG
+                            printf("[BATCH] found request %s ! now batching task id : %d \n",r->getReqName(), r->getTaskID());
+                            printf("[BATCH] there are total %d %s tasks batched for batched task \n",pBatchedReq->getNTask(), pBatchedReq->getReqName());
+#endif							
+                        }// if there are less tasks than max batch
+                        else break; // if control has jumped to here, it means batch is full. so break the loop
+                    } //found queued request								
+                } //search temp_list for the request		
+                ReqMtxVec[StrNetName]->unlock();							
+                //START Execution according to device's scheduling policy
+                if ( pBatchedReq->getState() == QUEUED ){
+                    switch(ServerState.DeviceExecMode[DeviceID]){
+                        case CON:
+                            break; // NOP
+                        case B2B:
+                        case PEB:
+                        case EB:			
+                            if (ServerState.isRunningVec[DeviceID] >= ServerState.DeviceMaxRun[DeviceID]) {
+                                continue;
+                            }
+                            else{
+                                ServerState.isRunningVec[DeviceID]++;
+                            }
+                            break;
+                        default: // not suppose to happen
+                            printf("please check execution mode!");
+                            exit(1);
+                    }
+                    pBatchedReq->setState(RUNNING);
+#ifdef DEBUG
+//                    if (isGPU(DeviceID))
+//                        printf("[BATCH] found %s as batched request for gpu %d \n",pBatchedReq->getReqName(), DeviceID);
+//                    else
+//                        printf("[BATCH] found %s as batched request for cpu\n",pBatchedReq->getReqName());
+#endif
+                    //initExecutionThread(pBatchedReq);
+                    handleExecution((void*)pBatchedReq);
+
+                    schedMtx.lock();
+                    doScheduling(&ServerState);
+                    schedMtx.unlock();
+                    }
+            }
+
+            if (pBatchedReq->getState() == EMPTY){ // possible since several threads will be looking at the request list
+#ifdef DEBUG
+                //		printf("[BATCH] exiting empty batch \n");
+
+#endif
+                //pBatchList->pop_front();
+                
+
+                break;
+
+            }
+        }// infinite loop, for pBatchedReq
+        delete pBatchedReq;
+    }// infinite loop, for perDeviceBatchCV
+}//batch handler function
+
+
+void SERVICE_fwd(float* in, int in_size, float* out, int out_size,
+        Net<float>* net) {
+#ifdef DEBUG
+    string NetName = net->name();
+    STATS_INIT("service", "DjiNN service inference");
+    PRINT_STAT_STRING("network", NetName.c_str());
+
+    if (Caffe::mode() == Caffe::CPU)
+        PRINT_STAT_STRING("platform", "cpu");
+    else
+        PRINT_STAT_STRING("platform", "gpu");
+    tic();
+#endif
+    //LOG(ERROR) << "got input blobs from net";
+    float loss;
+    vector<Blob<float>*> in_blobs = net->input_blobs(); 
+    in_blobs[0]->set_cpu_data(in);
+    vector<Blob<float>*> out_blobs;
+    out_blobs = net->ForwardPrefilled(&loss);
+    memcpy(out, out_blobs[0]->cpu_data(), sizeof(float));
+
+#ifdef DEBUG
+    PRINT_STAT_DOUBLE("inference latency", toc());
+    STATS_END();
+#endif
+
+    if (out_size != out_blobs[0]->count())
+        LOG(FATAL) << "out_size =! out_blobs[0]->count())";
+    else
+        memcpy(out, out_blobs[0]->cpu_data(), out_size * sizeof(float));
+}
+
+
+pthread_t initExecutionThread(batched_request *req) {
+    // Prepare to create a new pthread
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1024 * 1024);
+
+    // Create a new thread starting with the function handleExecution
+#ifdef DEBUG 
+    printf("[EXEC] Initiate thread for %d tasks of %s \n",req->getNTask(), req->getReqName());
+#endif 
+    pthread_t tid;
+    if (pthread_create(&tid, &attr, handleExecution, (void *)req) != 0)
+        LOG(ERROR) << "Failed to create a execution handler thread.\n";
+
+    pthread_join(tid, NULL);
+
+    return tid;
+}
+
+void* handleExecution(void* args) {
+    batched_request *input_info = (batched_request *)args;
+    for(int i=0; i <input_info->getNTask(); i++){
+        input_info->taskRequests[i]->prepExec=getCurNs();
+    }
+    int gpu_id = input_info->getGPUID();
+
+    char req_name[MAX_REQ_SIZE];
+    strcpy(req_name, input_info->getReqName());
+    uint64_t start,end;
+
+    map<string, Net<float>*>::iterator it = ServerState.Nets[0].find(req_name);
+    if (it == ServerState.Nets[0].end()) {
+        LOG(ERROR) << "Task " << req_name << " not found.";
+        return NULL;
+    } else
+        LOG(INFO) << "Task " << req_name << " forward pass.";
+
+    // receive the input data length (in float)
+    int sock_elts = input_info->getDataSize();
+
+    if (sock_elts < 0) {
+        LOG(ERROR) << "Error num incoming elts.";
+        return NULL;
+    }
+#if PROXY
+    
+#else
+#endif 
+    // reshape input dims if incoming data != current net config
+
+    reshape(ServerState.Nets[gpu_id][req_name], sock_elts);
+
+    int in_elts = ServerState.Nets[gpu_id][req_name]->input_blobs()[0]->count();
+    int out_elts = ServerState.Nets[gpu_id][req_name]->output_blobs()[0]->count();
+    float* in = (float*)malloc(in_elts * sizeof(float));
+    float* out = (float*)malloc(out_elts * sizeof(float));
+
+    // Warmup: used to move the network to the device for the first time
+    // In all subsequent forward passes, the trained model resides on the
+    /*
+       bool warmup = false;
+
+       if (warmup && gpu) {
+       printf("exeucting warmup\n");
+       float loss;
+       vector<Blob<float>*> in_blobs = nets[gpu_id][req_name]->input_blobs();
+       in_blobs[0]->set_cpu_data(input_info->b_input.data());
+       vector<Blob<float>*> out_blobs;
+       out_blobs = nets[gpu_id][req_name]->ForwardPrefilled(&loss);
+       warmup = false;
+       }
+       */
+
+    int tnum = input_info->getNTask();
+#ifdef DEBUG
+    printf("[EXEC]there are total %d tasks batched \n",tnum);
+    printf("[EXEC]batched task id : ");
+    for (int id=0; id<tnum;id++){
+        printf("%d ",input_info->taskRequests[id]->getTaskID());
+    }
+    printf("\n");
+#endif 
+
+    for (int id=0; id<tnum;id++){
+        input_info->taskRequests[id]->startExec=getCurNs();
+    }
+    // execMtx.lock();
+    if (!isGPU(input_info->getGPUID())) Caffe::set_mode(Caffe::CPU);
+    else Caffe::set_mode(Caffe::GPU);
+    //execMtx.unlock(); 	
+
+    SERVICE_fwd(input_info->b_input.data(), in_elts, out, out_elts, ServerState.Nets[gpu_id][req_name]);
+
+    for (int id=0; id<tnum;id++){
+        input_info->taskRequests[id]->endExec=getCurNs();
+    }	
+    ServerState.isRunningVec[gpu_id]--;
+   // gsc.updateGPUUtil(&ServerState, gpu_id, string(req_name),input_info->getBatchNum() ,false);
+    sendBatchedResults(input_info, out, out_elts);
+ //   ServerState.perDeviceBatchList[i]->pop_front();
+   
+    free(in);
+    free(out);
+
+    input_info->setState(END);
+    //  pthread_exit(NULL);
+    //  return (void*)0;
+}
+
+pthread_t initClearThread(){
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1024 * 1024); // set memory size, may need to adjust in the future, for now set it to 1MB
+    pthread_t tid;
+    if (pthread_create(&tid, &attr, handlerClear, NULL) != 0)
+        LOG(ERROR) << "Failed to create a request handler thread.\n";
+    return tid;
+}
+
+//clears memory allocated for batched reqeusts and requests
+void* handlerClear(void *vp){
+    string strReqName;
+    request *pReq=NULL;
+    TSList<request>* pReqList=NULL;
+    while(1){
+        unique_lock<mutex> lk(clearCVMtx);
+        clearCV.wait(lk, []{return clear;});
+        clearMtx.lock();
+        clear=0;
+        clearMtx.unlock();
+#ifdef DEBUG
+        //	printf("[CLEAR] clear thread running \n");
+#endif 
+        for(map<string, TSList<request>*>::iterator it=ServerState.ReqListHashTable.begin(); it != ServerState.ReqListHashTable.end();it++ ){
+            if (!it->second->getLength()) continue; // continue if linked list is empty
+            pReqList=it->second;
+            strReqName = it->first;
+            //	ReqMtxVec[strReqName]->lock();
+            for(int i=0; i<pReqList->getLength();i++){
+                pReq = ServerState.ReqListHashTable[strReqName]->at(i); 
+                if (!pReq) {i=0; continue;} // if not found due to race, high probability that it is busy
+                if (pReq->getState() == END) {
+                 //   pReq->writeToLog(pLogFile);
+                    ServerState.ReqListHashTable[strReqName]->eraseElement(i);	
+                    clearMtx.lock();
+                    clear--;
+                    clearMtx.unlock();
+#ifdef DEBUG
+//                    printf("[CLEAR] cleaning up %d th request!\n",pReq->getTaskID());	
+#endif
+                } // if ended request is found
+            } // iterate through linked list and search for ended requests
+            //	ReqMtxVec[strReqName]->unlock();
+
+        }// search through the hash table and search for linked lists that have requests
+
+        //monitors ready queues and resets 'ready' if there are left overs in the queue
+        if( !clear){ // check in case there are still left-over requests in linked list
+            for(map<string, TSList<request>*>::iterator it=ServerState.ReqListHashTable.begin(); it != ServerState.ReqListHashTable.end();it++ ){
+                if(it->second->getLength()){
+                    clearMtx.lock();
+                    clear=it->second->getLength();						
+                    //				clearCV.notify_all();
+                    clearMtx.unlock();
+                }
+            }
+        }
+        lk.unlock();
+    } // infinite loop
+}
+pthread_t initPerfMonThread(){ // for initiating performance monitor thread
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1024 * 1024); // set memory size, may need to adjust in the future, for now set it to 1MB
+    //init batch index table
+    pthread_t tid;
+    if (pthread_create(&tid, &attr, PerfMon, NULL) != 0)
+        LOG(ERROR) << "Failed to create performance monitor thread.\n";
+    return tid;
+}
+
+void* PerfMon(void *vp){
+
+#ifdef DEBUG
+  //  printf("[PERFMON] All performance will be logged per 50ms to service/throughput_log.txt and queue_log.txt \n");
+#endif 
+
+    FILE* ptpLog=fopen("throughput_log.txt","w");
+    FILE* pqLog =fopen("queue_log.txt", "w"); 
+    int useconds = 50 * 1000;
+    fprintf(ptpLog,"task,# of tasks executed / %dms \n",useconds/1000);
+    fflush(ptpLog);
+    fprintf(pqLog, "task,# of queued tasks / %dms \n",useconds/1000);
+    fflush(pqLog);
+    string TaskName;
+    int preExitCnt=0;
+    mutex PerfMtx;
+    unique_lock<mutex> lk(PerfMtx);
+    perfMonCV.wait(lk,[]{return perfstarted;});
+    while(1){
+        bool bReqFound = false;
+        for(map<string, int>::iterator it=ServerState.BatchTable.begin(); it != ServerState.BatchTable.end(); it++){	
+          //  if(it->second){		
+                bReqFound=true;
+                TaskName = it->first;
+                fprintf(pqLog,"%s,%d\n",TaskName.c_str(),ServerState.BatchTable[TaskName]);
+                fprintf(ptpLog,"%s,%d\n",TaskName.c_str(),ServerState.PerfTable[TaskName]);
+                fflush(pqLog);
+                fflush(ptpLog);
+                ServerState.PerfTable[TaskName]=0;
+           // }
+        }
+                if (!bReqFound) preExitCnt ++;
+                else preExitCnt = 0;
+                if (preExitCnt==1000) break;
+        usleep(useconds);	
+    }
+    lk.unlock();
+    return (void*)0; 
+}
+
+pthread_t initGPUUtilThread(){
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1024 * 1024); // set memory size, may need to adjust in the future, for now set it to 1MB
+    //init batch index table
+    pthread_t tid;
+    if (pthread_create(&tid, &attr, GPUUtilMon, NULL) != 0)
+        LOG(ERROR) << "Failed to create performance monitor thread.\n";
+    return tid;
+
+}
+
+void* GPUUtilMon(void * vp){
+//    int useconds = 10 * 1000; // for every 10 ms
+    mutex utilMtx;
+    unique_lock<mutex> lk(utilMtx);
+    int ngpus=gsc.getNGPUs();
+    utilMonCV.wait(lk,[]{return utilstarted;});
+    while(1){
+    for (int id =0; id < ngpus; id++){
+        getUtilization(*(gsc.getGPUMon(id)), ServerState.arrGPUUtil[id]);
+#ifdef DEBUG
+    //    printf("GPU %d utilization : %lf \n",id,ServerState.arrGPUUtil[id][3]);
+#endif 
+    }
+  //  usleep(useconds);
+    }
+    lk.unlock();
+    return (void*)0;
+}
+
+
+// called by each thread running on device
+void warmupDevice(int devID){
+    batched_request *pBatchedReq;
+    for (map<string, int>::iterator it=ServerState.BatchTable.begin(); it != ServerState.BatchTable.end(); it++){
+        string req_name = it->first;
+        int data_size;
+        // prepare data size, batch size : 1, refered to tonic suite code
+        if (req_name == "auto" ||  req_name == "auto1" || req_name == "auto2")
+            data_size =  1 * 28 * 28; 
+        else if (req_name == "dig" || req_name == "dig1" || req_name == "dig2")
+            data_size =  1 * 28 * 28; 
+        else if (req_name == "pos" || req_name == "pos1" || req_name == "pos2")
+            data_size = 300;
+        else if (req_name == "ner" || req_name == "ner1" || req_name == "ner2")
+            data_size = 375;
+        else if (req_name == "imc" || req_name == "imc1" || req_name == "imc2")
+            data_size = 3 * 227 * 227;
+        else if (req_name == "face" || req_name == "face1" || req_name == "face2" )
+            data_size = 3 * 152 * 152; 
+        else{
+            printf("invalid request type! exiting warmup \n!");
+            return;
+        }
+        reshape(ServerState.Nets[devID][req_name], data_size);
+        int in_elts = ServerState.Nets[devID][req_name]->input_blobs()[0]->count();
+        int out_elts = ServerState.Nets[devID][req_name]->output_blobs()[0]->count();
+
+        //prepare zero-filled data 
+        float* in = (float*)malloc(in_elts * sizeof(float));
+        memset(in,0,sizeof(in));
+
+        float* out = (float*)malloc(out_elts * sizeof(float));             
+        if (!isGPU(devID)) Caffe::set_mode(Caffe::CPU);
+        else Caffe::set_mode(Caffe::GPU);     
+        SERVICE_fwd(in, in_elts, out, out_elts, ServerState.Nets[devID][req_name]);
+    }
+        
+}
+pthread_t initEpochThread(){
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1024 * 1024); // set memory size, may need to adjust in the future, for now set it to 1MB
+    pthread_t tid;
+    if (pthread_create(&tid, &attr, initEpoch, NULL) != 0)
+        LOG(ERROR) << "Failed to create a request handler thread.\n";
+    return tid;
+
+}                                                                                                                                       
+void* initEpoch(void *vp){
+    int useconds = 1000 * 1000 ; // for every 1s , 1000ms 
+    while(1){
+        usleep(useconds);
+        schedMtx.lock();
+        gsc.resetEpoch();
+        schedMtx.unlock();
+    }
+}
+
+/*pthread_t initProxyListener(int gpuid){
+     pthread_attr_t attr;
+     pthread_attr_init(&attr);
+     pthread_attr_setstacksize(&attr, 1024 * 1024); // set memory size, may need to adjust in the future, for now set it to 1MB 
+     pthread_t tid;
+     if (pthread_create(&tid, &attr, listentoproxy, (void*)(intptr_t)gpuid) != 0)
+        LOG(ERROR) << "Failed to create a request handler thread.\n"; 
+    return tid;
+} */    
