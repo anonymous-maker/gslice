@@ -1,3 +1,3 @@
 # gslice
-gSlice:SlicingGPUstoServeSLO-sensitiveHeterogeneousInferenceRequests
+gSlice:Slicing GPUs to Serve SLO-sensitive Heterogeneous Inference Requests
 
